@@ -378,3 +378,156 @@ print("  with dx_count >= 2:", (missed["t2dm_dx_count"] >= 2).sum())
 
 
 
+
+
+
+
+
+
+
+
+
+# ---- CONTROL ALGORITHM: data-availability probe ----
+# Q1: does Coherent encode family history of diabetes? Search condition descriptions.
+fh = conditions[conditions["DESCRIPTION"].str.contains("family history", case=False, na=False)]
+print("family-history condition rows:", len(fh))
+print(fh["DESCRIPTION"].value_counts().head(10).to_string() if len(fh) else "  (none)")
+
+# Q2: prediabetes / impaired-glucose / gestational — the broad Table 9 categories.
+# These must EXCLUDE people from controls. How prevalent are they?
+for term in ["prediabet", "impaired", "gestational", "glycosuria", "screening for diabet"]:
+    n = conditions[conditions["DESCRIPTION"].str.contains(term, case=False, na=False)]["PATIENT"].nunique()
+    print(f"  '{term}': {n} patients")
+
+# Q3: encounters — does encounters.csv have an office/outpatient type we can count?
+enc = pd.read_csv("encounters.csv")
+print("\nencounter columns:", list(enc.columns))
+if "ENCOUNTERCLASS" in enc.columns:
+    print(enc["ENCOUNTERCLASS"].value_counts().to_string())
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# --- Broad DM diagnosis codes (SNOMED) for CONTROL exclusion (PheKB Table 9).
+# --- Any of these disqualifies a patient from being a clean control.
+# --- Narrower than Table 9: gestational/glycosuria/screening absent in Coherent.
+# --- Excludes 386806002 (impaired cognition) — false hit from text search, not glucose-related.
+DM_DX_BROAD = [
+    "15777000",         # Prediabetes
+    "44054006",         # Diabetes
+    "127013003",        # Diabetic renal disease
+    "80394007",         # Hyperglycemia
+    "368581000119106",  # Neuropathy due to T2DM
+    "422034002",        # Diabetic retinopathy, T2
+    "1551000119108",    # Nonproliferative retinopathy, T2
+    "90781000119102",   # Microalbuminuria due to T2DM
+    "97331000119101",   # Macular edema + retinopathy, T2
+    "1501000119109",    # Proliferative retinopathy, T2
+    "157141000119108",  # Proteinuria due to T2DM
+    "60951000119105",   # Blindness due to T2DM
+    "427089005",        # Diabetes from Cystic Fibrosis
+]
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# CONTROL ALGORITHM (PheKB Algorithm 8). One path, six conditions,
+# ALL must be true. Logic: prove the patient is clearly NOT diabetic.
+# Adjusted for Coherent: supplies empty, family-history absent (both noted).
+# ============================================================
+
+# Load encounters (new file). supplies.csv is empty (0 rows) so we skip it.
+encounters = pd.read_csv("encounters.csv")
+encounters["CODE"] = encounters["CODE"].astype(str)  # harmless, keeps types consistent
+
+# --- Condition 1: dm_dx_broad_count == 0 (broad Table 9 list) ---
+# Distinct dates with ANY diabetes-related dx. Must be zero for a control.
+dm_broad_count = (conditions[conditions["CODE"].isin(DM_DX_BROAD)]
+                  .groupby("PATIENT")["START"].nunique())
+
+# --- Condition 2: glucose_lab_exists == True ---
+# Patient must have had at least one glucose lab drawn (proves they were screened).
+glucose_drawn = set(observations[observations["CODE"].isin(GLUCOSE)]["PATIENT"].unique())
+
+# --- Condition 3: abnormal_lab_control == False (LOOSER thresholds) ---
+# Control abnormal = random glucose >110 OR A1c >=6.0 (vs case 200 / 6.5).
+# Fasting still unavailable in Coherent. Reuse a1c/glu frames already numeric-coerced.
+glu_ctrl = observations[observations["CODE"].isin(GLUCOSE)].copy()
+glu_ctrl["VALUE"] = pd.to_numeric(glu_ctrl["VALUE"], errors="coerce")
+a1c_ctrl = observations[observations["CODE"].isin(A1C)].copy()
+a1c_ctrl["VALUE"] = pd.to_numeric(a1c_ctrl["VALUE"], errors="coerce")
+ctrl_abnormal_pts = (set(glu_ctrl[glu_ctrl["VALUE"] > 110]["PATIENT"])
+                     | set(a1c_ctrl[a1c_ctrl["VALUE"] >= 6.0]["PATIENT"]))
+
+# --- Condition 4: office_visit_count >= 2 ---
+# Distinct dates of in-person clinic visits. Your chosen classes only.
+OFFICE_CLASSES = ["ambulatory", "wellness", "outpatient"]
+encounters["START"] = pd.to_datetime(encounters["START"])
+office = encounters[encounters["ENCOUNTERCLASS"].isin(OFFICE_CLASSES)]
+office_visit_count = office.groupby("PATIENT")["START"].dt.date.nunique() \
+    if False else office.groupby("PATIENT")["START"].apply(lambda s: s.dt.date.nunique())
+
+# --- Condition 5: dm_meds_count == 0 (supplies empty, so meds only) ---
+# Any T2D oral OR insulin disqualifies. Table 8 supplies dead -> omitted.
+dm_med_pts = set(medications[medications["CODE"].isin(T2D_MED + INSULIN)]["PATIENT"].unique())
+
+# --- Condition 6: fam_hist == False ---
+# No family-history data in Coherent -> defaults False for everyone (no filtering).
+
+# --- ASSEMBLE control facts onto the per-patient table ---
+per["dm_broad_count"]    = dm_broad_count
+per["dm_broad_count"]    = per["dm_broad_count"].fillna(0).astype(int)
+per["glucose_drawn"]     = per.index.isin(glucose_drawn)
+per["ctrl_abnormal_lab"] = per.index.isin(ctrl_abnormal_pts)
+per["office_visits"]     = office_visit_count
+per["office_visits"]     = per["office_visits"].fillna(0).astype(int)
+per["on_dm_med"]         = per.index.isin(dm_med_pts)
+
+def is_control(p):
+    return (p["dm_broad_count"] == 0          # cond 1: no diabetes-related dx
+            and p["glucose_drawn"]            # cond 2: glucose was measured
+            and not p["ctrl_abnormal_lab"]    # cond 3: clean at loose thresholds
+            and p["office_visits"] >= 2       # cond 4: regular outpatient
+            and not p["on_dm_med"]            # cond 5: no DM meds (supplies empty)
+            # cond 6: family history always False -> always passes
+            )
+
+per["control"] = per.apply(is_control, axis=1)
+
+# --- REPORT ---
+n_ctrl = per["control"].sum()
+n_case = (per["path"] != "UNKNOWN").sum()
+n_mid  = len(per) - n_ctrl - n_case
+print("\n===== CONTROL ALGORITHM =====")
+print("cases:    ", n_case)
+print("controls: ", n_ctrl)
+print("middle:   ", n_mid, "({:.1%})".format(n_mid/len(per)))
+print("\ncontrol condition attrition (whole population):")
+print("  dm_broad_count == 0:", (per["dm_broad_count"] == 0).sum())
+print("  glucose drawn:      ", per["glucose_drawn"].sum())
+print("  clean (loose) lab:  ", (~per["ctrl_abnormal_lab"]).sum())
+print("  >=2 office visits:  ", (per["office_visits"] >= 2).sum())
+print("  no DM med:          ", (~per["on_dm_med"]).sum())
+
+# sanity: no patient should be both case and control
+both = per[(per["path"] != "UNKNOWN") & per["control"]]
+print("\npatients flagged BOTH case and control (must be 0):", len(both))
